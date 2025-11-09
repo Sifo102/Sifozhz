@@ -1,128 +1,185 @@
-name: VPS-SSH
-on:
-  workflow_dispatch:
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Sifo Telegram bot — VPS-ready full version.
+يشغل نفسه كخادم، يستقبل ملفات .py، يشغلها، يوقفها، ويعيد تشغيلها تلقائياً.
+"""
 
-jobs:
-  configure-vps:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
+import os, sys, time, json, threading, subprocess, signal, traceback
+from urllib import request, parse
 
-      - name: Show header
-        run: |
-          echo "=== Configure VPS for SSH (port 22) ==="
+# ========= إعداد التوكن =========
+# ⚠️ ضع توكن بوتك هنا بين علامتي التنصيص ↓↓↓
+TOKEN = "8407863189:AAFymLb1zhM4Gq2q7YSIKhV5M37K8eTunRk"
+# =================================
+if not TOKEN:
+    print("❌ لم يتم تحديد التوكن. أضفه داخل الكود أو في متغير بيئي TELEGRAM_TOKEN.")
+    sys.exit(1)
 
-      - name: Update & install OpenSSH and UFW
-        run: |
-          sudo apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server ufw curl
+BASE = f"https://api.telegram.org/bot{TOKEN}"
+GETUPDATES = BASE + "/getUpdates"
+SENDMSG = BASE + "/sendMessage"
+GETFILE = BASE + "/getFile"
 
-      - name: Ensure sshd runtime dir exists and set basic config
-        run: |
-          sudo mkdir -p /var/run/sshd
-          # Ensure sshd listens on port 22 and allow password auth (we'll restart later)
-          sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak || true
-          sudo sed -i 's/^#\?Port .*/Port 22/' /etc/ssh/sshd_config
-          sudo sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin no/' /etc/ssh/sshd_config
-          sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+APP_DIR = os.path.abspath(os.path.dirname(__file__))
+UPLOAD_FOLDER = os.path.join(APP_DIR, "telegram_bot_files")
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+OFFSET_FILE = os.path.join(APP_DIR, ".offset")
+LONG_POLL = 15
 
-      - name: Create SSH user and set password
-        env:
-          SSH_USER: TOOLBOXLAP
-          SSH_PASS: ${{ secrets.SSH_PASSWORD }}
-        run: |
-          USER="${SSH_USER:-TOOLBOXLAP}"
-          PASS="${SSH_PASS:-admin@123}"
-          echo "Creating user: $USER"
-          # create user if not exists
-          if ! id -u "$USER" >/dev/null 2>&1; then
-            sudo useradd -m -s /bin/bash "$USER"
-            # add to sudoers
-            sudo usermod -aG sudo "$USER"
-          fi
-          # set password (chpasswd expects "user:pass")
-          echo "${USER}:${PASS}" | sudo chpasswd
-          # force password change disabled (account never expires)
-          sudo chage -M -1 "$USER" || true
-          # export credentials into job summary and environment for later steps
-          echo "SSH_USER=${USER}" >> $GITHUB_ENV
-          echo "SSH_PASS_SET=1" >> $GITHUB_ENV
-          # Do not print the password in logs except in a controlled place later if you want.
-          echo "User ${USER} created/ensured."
+active_processes = {}
+file_status = {}
+process_outputs = {}
 
-      - name: Open firewall port 22 (UFW) and allow SSH
-        run: |
-          # configure UFW non-interactively
-          sudo ufw allow 22/tcp
-          sudo ufw --force enable
-          sudo ufw status verbose
+# ========= تثبيت requests إن لزم =========
+def ensure_requests():
+    try:
+        import requests
+        return requests
+    except Exception:
+        print("📦 تثبيت مكتبة requests ...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
+        import requests
+        return requests
+requests = ensure_requests()
 
-      - name: Restart sshd
-        run: |
-          sudo systemctl restart ssh || sudo service ssh restart
-          sleep 2
-          sudo systemctl status ssh --no-pager || sudo service ssh status
+# ========= إرسال رسالة =========
+def send(chat_id, text):
+    try:
+        data = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+        requests.post(SENDMSG, data=data, timeout=10)
+    except Exception as e:
+        print("send error:", e)
 
-      - name: Get public IP and verify SSH port reachable
-        run: |
-          # fetch public IP
-          PUBLIC_IP="$(curl -s https://api.ipify.org)"
-          if [ -z "$PUBLIC_IP" ]; then
-            PUBLIC_IP="$(curl -s https://ifconfig.me || true)"
-          fi
-          if [ -z "$PUBLIC_IP" ]; then
-            echo "ERROR: Could not determine public IP address."
-            exit 1
-          fi
-          echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
-          echo "Public IP: $PUBLIC_IP"
+# ========= حفظ/قراءة offset =========
+def read_offset():
+    try:
+        if os.path.exists(OFFSET_FILE):
+            return int(open(OFFSET_FILE).read().strip())
+    except: pass
+def write_offset(v):
+    try: open(OFFSET_FILE,"w").write(str(v))
+    except: pass
 
-          # quick test: check if port 22 open locally and remotely (if NAT/public)
-          echo "Checking local SSH port (22)..."
-          ss -tlnp | grep ':22 ' || true
-          echo "Attempting TCP connection test to $PUBLIC_IP:22 (may fail on GH runners behind NAT)..."
-          # Use netcat if available, otherwise attempt bash /dev/tcp
-          if command -v nc >/dev/null 2>&1; then
-            nc -z -w 5 "$PUBLIC_IP" 22 && echo "TCP to $PUBLIC_IP:22 succeeded" || echo "TCP to $PUBLIC_IP:22 failed or blocked"
-          else
-            (timeout 5 bash -c "cat < /dev/null > /dev/tcp/$PUBLIC_IP/22") && echo "TCP to $PUBLIC_IP:22 succeeded" || echo "TCP to $PUBLIC_IP:22 failed or blocked"
-          fi
+# ========= تحميل الملفات =========
+def download_file(file_id, file_name):
+    try:
+        info = requests.get(f"{GETFILE}?file_id={file_id}", timeout=10).json()
+        path = info["result"]["file_path"]
+        url = f"https://api.telegram.org/file/bot{TOKEN}/{path}"
+        data = requests.get(url, timeout=20).content
+        open(os.path.join(UPLOAD_FOLDER,file_name),"wb").write(data)
+        return True
+    except Exception as e:
+        print("download error:", e)
+        return False
 
-      - name: Output Termux connection info (visible in logs)
-        run: |
-          USER="${SSH_USER:-TOOLBOXLAP}"
-          PUBLIC_IP="${PUBLIC_IP:-$(curl -s https://api.ipify.org)}"
-          PASS="${{ secrets.SSH_PASSWORD }}"
-          # fallback to default if secret not set (do not expose secret variable directly)
-          if [ -z "$PASS" ]; then
-            PASS="admin@123"
-          fi
+# ========= تشغيل ملفات بايثون =========
+def run_python_file(filename, chat_id):
+    fp = os.path.join(UPLOAD_FOLDER, filename)
+    if not os.path.exists(fp):
+        send(chat_id, f"❌ الملف `{filename}` غير موجود")
+        return
+    if filename in active_processes:
+        stop_file(filename)
+    proc = subprocess.Popen([sys.executable, "-u", fp],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, bufsize=1)
+    active_processes[filename] = proc
+    file_status[filename] = {"status":"running","start":time.time(),"restart":0}
+    threading.Thread(target=monitor_proc, args=(filename,chat_id),daemon=True).start()
+    send(chat_id, f"✅ تم تشغيل `{filename}` (PID {proc.pid})")
 
-          echo
-          echo "=== SSH ACCESS INFO ==="
-          echo "Host (Public IP): $PUBLIC_IP"
-          echo "Port: 22"
-          echo "User: $USER"
-          echo "Password: (the password you set in Actions secret SSH_PASSWORD or default admin@123)"
-          echo
-          echo "To connect from Termux on your Android device, run:"
-          echo "ssh ${USER}@${PUBLIC_IP} -p 22"
-          echo
-          echo "If you prefer key-based auth (recommended):"
-          echo "1) Generate key on Termux: ssh-keygen -t ed25519"
-          echo "2) Copy public key to server (replace /home/${USER}/.ssh/authorized_keys):"
-          echo "   scp ~/.ssh/id_ed25519.pub ${USER}@${PUBLIC_IP}:/tmp/pubkey"
-          echo "   ssh ${USER}@${PUBLIC_IP} 'mkdir -p ~/.ssh && cat /tmp/pubkey >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys && rm /tmp/pubkey'"
-          echo "========================"
+def stop_file(filename):
+    if filename not in active_processes:
+        return
+    proc = active_processes.pop(filename)
+    file_status[filename]["status"] = "stopped"
+    proc.terminate()
+    try: proc.wait(timeout=3)
+    except: proc.kill()
 
-      - name: Keep workflow alive for manual testing (optional)
-        if: ${{ always() }}
-        run: |
-          echo "Workflow finished configuration. If you want the job to keep running (so runner stays up), uncomment the loop below."
-          # NOTE: GitHub-hosted runners are ephemeral. Keeping the job alive does NOT give you a permanent VPS.
-          # Uncomment the following lines only if you intentionally want to keep this workflow job running for some time:
-          #
-          # while true; do
-          #   echo "[$(date)] runner alive - press ctrl+c in logs to stop"
-          #   sleep 300
-          # done
+def monitor_proc(filename, chat_id):
+    proc = active_processes[filename]
+    while True:
+        line = proc.stdout.readline()
+        if line:
+            process_outputs[filename]=line.strip()
+            if any(x in line.lower() for x in ["error","exception"]):
+                send(chat_id, f"⚠️ `{filename}`: `{line.strip()}`")
+        err = proc.stderr.readline()
+        if err:
+            send(chat_id, f"❌ `{filename}` stderr: `{err.strip()}`")
+        if proc.poll() is not None: break
+        time.sleep(0.1)
+    send(chat_id, f"⏹ `{filename}` توقف.")
+
+# ========= تثبيت مكتبات =========
+def install_lib(chat_id, lib):
+    send(chat_id, f"⏳ تثبيت `{lib}` ...")
+    r = subprocess.run([sys.executable,"-m","pip","install",lib],capture_output=True,text=True)
+    if r.returncode==0:
+        send(chat_id, f"✅ تم تثبيت `{lib}`")
+    else:
+        send(chat_id, f"❌ خطأ:\n```\n{r.stderr[-800:]}\n```")
+
+# ========= التعامل مع الرسائل =========
+def handle_message(chat_id, text):
+    if text.startswith("/install "):
+        install_lib(chat_id, text.split(" ",1)[1]); return
+    if text.startswith("/run "):
+        run_python_file(text.split(" ",1)[1], chat_id); return
+    if text.startswith("/stop "):
+        stop_file(text.split(" ",1)[1]); send(chat_id,"🛑 تم الإيقاف."); return
+    if text=="/files":
+        fs=[f for f in os.listdir(UPLOAD_FOLDER) if f.endswith(".py")]
+        send(chat_id,"📂 الملفات:\n"+"\n".join(fs) if fs else "لا ملفات.")
+        return
+    send(chat_id,"⚙️ الأوامر:\n/install lib\n/run file.py\n/stop file.py\n/files")
+
+def handle_update(u):
+    try:
+        msg=u.get("message") or {}
+        chat=msg.get("chat",{}); cid=chat.get("id")
+        if "text" in msg:
+            handle_message(cid, msg["text"])
+        if "document" in msg:
+            d=msg["document"]; fn=d.get("file_name","")
+            if fn.endswith(".py"):
+                send(cid,f"⬇️ تحميل `{fn}` ...")
+                if download_file(d["file_id"],fn):
+                    send(cid,"✅ تم الحفظ، التشغيل الآن.")
+                    run_python_file(fn,cid)
+                else:
+                    send(cid,"❌ فشل التحميل.")
+    except Exception:
+        print(traceback.format_exc())
+
+# ========= الحلقة الرئيسية =========
+def main():
+    print("🚀 Sifo bot بدأ العمل.")
+    off=read_offset()
+    while True:
+        try:
+            p={"timeout":LONG_POLL,"limit":100}
+            if off: p["offset"]=off
+            r=requests.get(GETUPDATES,params=p,timeout=LONG_POLL+5).json()
+            for u in r.get("result",[]):
+                off=u["update_id"]+1; write_offset(off)
+                threading.Thread(target=handle_update,args=(u,),daemon=True).start()
+        except Exception as e:
+            print("loop error:",e)
+            time.sleep(2)
+
+def stop_all(signum=None, frame=None):
+    print("🛑 إيقاف جميع العمليات.")
+    for f,p in list(active_processes.items()):
+        try: p.terminate()
+        except: pass
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, stop_all)
+signal.signal(signal.SIGTERM, stop_all)
+
+if __name__=="__main__":
+    main()
