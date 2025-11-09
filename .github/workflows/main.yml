@@ -1,235 +1,128 @@
-name: VPS Server
+name: VPS-SSH
 on:
   workflow_dispatch:
+
 jobs:
-  deploy-vps:
-    runs-on: windows-latest
-    timeout-minutes: 10080
+  configure-vps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-      - name: Configure VPS Core Settings
-        run: |
-          # Enable RDP
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-          
-          # Configure firewall for SSH and RDP
-          netsh advfirewall firewall set rule group="remote desktop" new enable=Yes
-          netsh advfirewall firewall add rule name="SSH-Server" dir=in action=allow protocol=TCP localport=22
-          netsh advfirewall firewall add rule name="RDP-Server" dir=in action=allow protocol=TCP localport=3389
-          netsh advfirewall firewall add rule name="HTTP-Server" dir=in action=allow protocol=TCP localport=80
-          netsh advfirewall firewall add rule name="HTTPS-Server" dir=in action=allow protocol=TCP localport=443
-          
-          Restart-Service -Name TermService -Force
-          Write-Host "✅ VPS core configuration completed"
 
-      - name: Create VPS User Account
+      - name: Show header
         run: |
-          $username = "vpsadmin"
-          $password = "Admin@12345"
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          echo "=== Configure VPS for SSH (port 22) ==="
 
-          # Remove existing user and create new
-          Remove-LocalUser -Name $username -ErrorAction SilentlyContinue
-          Start-Sleep -Seconds 2
-          
-          New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member $username
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
-          Add-LocalGroupMember -Group "Remote Management Users" -Member $username
-          Enable-LocalUser -Name $username
-          
-          echo "VPS_USERNAME=$username" >> $env:GITHUB_ENV
-          echo "VPS_PASSWORD=$password" >> $env:GITHUB_ENV
-          Write-Host "✅ VPS user created: $username"
-
-      - name: Install and Configure OpenSSH Server
+      - name: Update & install OpenSSH and UFW
         run: |
-          # Install OpenSSH Server
-          Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
-          
-          # Start and configure SSH service
-          Start-Service sshd
-          Set-Service -Name sshd -StartupType 'Automatic'
-          
-          # Configure SSH server
-          $sshdConfig = @"
-Port 22
-Protocol 2
-PasswordAuthentication yes
-PubkeyAuthentication yes
-PermitEmptyPasswords no
-Subsystem sftp sftp-server.exe
-"@
-          Set-Content -Path "$env:ProgramData\ssh\sshd_config" -Value $sshdConfig -Force
-          
-          # Restart SSH service
-          Restart-Service sshd
-          Write-Host "✅ SSH Server installed and configured on port 22"
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server ufw curl
 
-      - name: Install Web Server (IIS)
+      - name: Ensure sshd runtime dir exists and set basic config
         run: |
-          # Install IIS
-          Enable-WindowsOptionalFeature -Online -FeatureName IIS-WebServerRole -All
-          Enable-WindowsOptionalFeature -Online -FeatureName IIS-WebServer -All
-          Enable-WindowsOptionalFeature -Online -FeatureName IIS-CommonHttpFeatures -All
-          Start-Service -Name W3SVC
-          Set-Service -Name W3SVC -StartupType Automatic
-          
-          # Create VPS info page
-          $htmlContent = @"
-<!DOCTYPE html>
-<html>
-<head>
-    <title>VPS Server</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 40px; }
-        .container { max-width: 800px; margin: 0 auto; }
-        .header { background: #0078d4; color: white; padding: 20px; border-radius: 5px; }
-        .info { background: #f3f2f1; padding: 15px; margin: 10px 0; border-radius: 5px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>Windows VPS Server</h1>
-            <p>Ready for SSH and RDP connections</p>
-        </div>
-        <div class="info">
-            <h3>Connection Information</h3>
-            <p><strong>SSH:</strong> Port 22</p>
-            <p><strong>RDP:</strong> Port 3389</p>
-            <p><strong>Web:</strong> Port 80</p>
-        </div>
-    </div>
-</body>
-</html>
-"@
-          Set-Content -Path "C:\inetpub\wwwroot\iisstart.html" -Value $htmlContent -Force
-          Write-Host "✅ Web Server installed"
+          sudo mkdir -p /var/run/sshd
+          # Ensure sshd listens on port 22 and allow password auth (we'll restart later)
+          sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak || true
+          sudo sed -i 's/^#\?Port .*/Port 22/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin no/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
 
-      - name: Install Ngrok for Public Access
+      - name: Create SSH user and set password
+        env:
+          SSH_USER: TOOLBOXLAP
+          SSH_PASS: ${{ secrets.SSH_PASSWORD }}
         run: |
-          # Download Ngrok
-          $ngrokUrl = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
-          $ngrokZip = "$env:TEMP\ngrok.zip"
-          $ngrokDir = "C:\ngrok"
-          
-          Invoke-WebRequest -Uri $ngrokUrl -OutFile $ngrokZip
-          New-Item -ItemType Directory -Path $ngrokDir -Force
-          Expand-Archive -Path $ngrokZip -DestinationPath $ngrokDir -Force
-          Remove-Item $ngrokZip -Force
-          Write-Host "✅ Ngrok installed"
+          USER="${SSH_USER:-TOOLBOXLAP}"
+          PASS="${SSH_PASS:-admin@123}"
+          echo "Creating user: $USER"
+          # create user if not exists
+          if ! id -u "$USER" >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash "$USER"
+            # add to sudoers
+            sudo usermod -aG sudo "$USER"
+          fi
+          # set password (chpasswd expects "user:pass")
+          echo "${USER}:${PASS}" | sudo chpasswd
+          # force password change disabled (account never expires)
+          sudo chage -M -1 "$USER" || true
+          # export credentials into job summary and environment for later steps
+          echo "SSH_USER=${USER}" >> $GITHUB_ENV
+          echo "SSH_PASS_SET=1" >> $GITHUB_ENV
+          # Do not print the password in logs except in a controlled place later if you want.
+          echo "User ${USER} created/ensured."
 
-      - name: Start SSH Tunnel with Ngrok
+      - name: Open firewall port 22 (UFW) and allow SSH
         run: |
-          # Start Ngrok tunnel for SSH
-          Start-Process -FilePath "C:\ngrok\ngrok.exe" -ArgumentList "tcp 22" -WindowStyle Hidden
-          Write-Host "✅ Ngrok SSH tunnel started"
-          
-          # Wait for tunnel to establish
-          Start-Sleep -Seconds 15)
-          
-          # Get tunnel information
-          try {
-              $tunnelInfo = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -TimeoutSec 10
-              $sshUrl = $tunnelInfo.tunnels[0].public_url
-              $sshHost = $sshUrl -replace 'tcp://', ''
-              echo "SSH_TUNNEL=$sshHost" >> $env:GITHUB_ENV
-              Write-Host "✅ SSH Tunnel: $sshHost"
-          } catch {
-              Write-Host "⚠️ Could not get Ngrok URL automatically"
-              echo "SSH_TUNNEL=check_dashboard" >> $env:GITHUB_ENV
-          }
+          # configure UFW non-interactively
+          sudo ufw allow 22/tcp
+          sudo ufw --force enable
+          sudo ufw status verbose
 
-      - name: Start RDP Tunnel with Ngrok
+      - name: Restart sshd
         run: |
-          # Start Ngrok tunnel for RDP
-          Start-Process -FilePath "C:\ngrok\ngrok.exe" -ArgumentList "tcp 3389" -WindowStyle Hidden
-          Write-Host "✅ Ngrok RDP tunnel started"
-          
-          # Wait for tunnel to establish
-          Start-Sleep -Seconds 15)
-          
-          # Get tunnel information
-          try {
-              $tunnelInfo = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -TimeoutSec 10
-              $rdpUrl = $tunnelInfo.tunnels[1].public_url
-              $rdpHost = $rdpUrl -replace 'tcp://', ''
-              echo "RDP_TUNNEL=$rdpHost" >> $env:GITHUB_ENV
-              Write-Host "✅ RDP Tunnel: $rdpHost"
-          } catch {
-              Write-Host "⚠️ Could not get RDP tunnel URL"
-              echo "RDP_TUNNEL=check_dashboard" >> $env:GITHUB_ENV
-          }
+          sudo systemctl restart ssh || sudo service ssh restart
+          sleep 2
+          sudo systemctl status ssh --no-pager || sudo service ssh status
 
-      - name: Get Public IP
+      - name: Get public IP and verify SSH port reachable
         run: |
-          try {
-              $publicIP = Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 10
-              echo "PUBLIC_IP=$publicIP" >> $env:GITHUB_ENV
-              Write-Host "🌍 Public IP: $publicIP"
-          } catch {
-              Write-Host "⚠️ Could not get public IP"
-              echo "PUBLIC_IP=unknown" >> $env:GITHUB_ENV
-          }
+          # fetch public IP
+          PUBLIC_IP="$(curl -s https://api.ipify.org)"
+          if [ -z "$PUBLIC_IP" ]; then
+            PUBLIC_IP="$(curl -s https://ifconfig.me || true)"
+          fi
+          if [ -z "$PUBLIC_IP" ]; then
+            echo "ERROR: Could not determine public IP address."
+            exit 1
+          fi
+          echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
+          echo "Public IP: $PUBLIC_IP"
 
-      - name: Display VPS Connection Information
-        run: |
-          Write-Host ""
-          Write-Host "🎯 ==================== VPS SERVER READY ===================="
-          Write-Host "👤 Username: $env:VPS_USERNAME"
-          Write-Host "🔑 Password: $env:VPS_PASSWORD"
-          Write-Host ""
-          Write-Host "🔗 SSH CONNECTION (Termux):"
-          Write-Host "   Host: $env:SSH_TUNNEL"
-          Write-Host "   Port: (use the port from above)"
-          Write-Host "   Username: $env:VPS_USERNAME"
-          Write-Host "   Password: $env:VPS_PASSWORD"
-          Write-Host ""
-          Write-Host "💻 RDP CONNECTION:"
-          Write-Host "   Host: $env:RDP_TUNNEL"
-          Write-Host "   Username: $env:VPS_USERNAME"
-          Write_Host "   Password: $env:VPS_PASSWORD"
-          Write-Host ""
-          Write-Host "🌐 WEB SERVER:"
-          Write-Host "   http://$env:PUBLIC_IP"
-          Write-Host ""
-          Write-Host "📋 ALTERNATIVE:"
-          Write-Host "   Visit: https://dashboard.ngrok.com/status/tunnels"
-          Write-Host "   To see all active tunnels"
-          Write-Host ""
-          Write-Host "🔧 PORTS OPEN:"
-          Write-Host "   SSH: 22, RDP: 3389, HTTP: 80, HTTPS: 443"
-          Write-Host ""
-          Write-Host "⏰ DURATION: 7 DAYS"
-          Write-Host "=========================================================="
-          Write-Host ""
+          # quick test: check if port 22 open locally and remotely (if NAT/public)
+          echo "Checking local SSH port (22)..."
+          ss -tlnp | grep ':22 ' || true
+          echo "Attempting TCP connection test to $PUBLIC_IP:22 (may fail on GH runners behind NAT)..."
+          # Use netcat if available, otherwise attempt bash /dev/tcp
+          if command -v nc >/dev/null 2>&1; then
+            nc -z -w 5 "$PUBLIC_IP" 22 && echo "TCP to $PUBLIC_IP:22 succeeded" || echo "TCP to $PUBLIC_IP:22 failed or blocked"
+          else
+            (timeout 5 bash -c "cat < /dev/null > /dev/tcp/$PUBLIC_IP/22") && echo "TCP to $PUBLIC_IP:22 succeeded" || echo "TCP to $PUBLIC_IP:22 failed or blocked"
+          fi
 
-      - name: Maintain VPS Services
+      - name: Output Termux connection info (visible in logs)
         run: |
-          Write-Host "🔄 VPS Server is running and maintaining services..."
-          
-          while ($true) {
-              # Check and restart critical services
-              $services = @("TermService", "sshd", "W3SVC")
-              foreach ($service in $services) {
-                  $svc = Get-Service -Name $service -ErrorAction SilentlyContinue
-                  if ($svc -and $svc.Status -ne 'Running') {
-                      Write-Host "🔄 Restarting $service..."
-                      Start-Service -Name $service
-                  }
-              }
-              
-              # Check Ngrok processes
-              $ngrokProcesses = Get-Process -Name "ngrok" -ErrorAction SilentlyContinue
-              if ($ngrokProcesses.Count -lt 2) {
-                  Write-Host "🔄 Restarting Ngrok tunnels..."
-                  Start-Process -FilePath "C:\ngrok\ngrok.exe" -ArgumentList "tcp 22" -WindowStyle Hidden
-                  Start-Sleep -Seconds 5
-                  Start-Process -FilePath "C:\ngrok\ngrok.exe" -ArgumentList "tcp 3389" -WindowStyle Hidden
-              }
-              
-              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ✅ VPS Active - SSH: $env:SSH_TUNNEL"
-              Start-Sleep -Seconds 60
-          }
+          USER="${SSH_USER:-TOOLBOXLAP}"
+          PUBLIC_IP="${PUBLIC_IP:-$(curl -s https://api.ipify.org)}"
+          PASS="${{ secrets.SSH_PASSWORD }}"
+          # fallback to default if secret not set (do not expose secret variable directly)
+          if [ -z "$PASS" ]; then
+            PASS="admin@123"
+          fi
+
+          echo
+          echo "=== SSH ACCESS INFO ==="
+          echo "Host (Public IP): $PUBLIC_IP"
+          echo "Port: 22"
+          echo "User: $USER"
+          echo "Password: (the password you set in Actions secret SSH_PASSWORD or default admin@123)"
+          echo
+          echo "To connect from Termux on your Android device, run:"
+          echo "ssh ${USER}@${PUBLIC_IP} -p 22"
+          echo
+          echo "If you prefer key-based auth (recommended):"
+          echo "1) Generate key on Termux: ssh-keygen -t ed25519"
+          echo "2) Copy public key to server (replace /home/${USER}/.ssh/authorized_keys):"
+          echo "   scp ~/.ssh/id_ed25519.pub ${USER}@${PUBLIC_IP}:/tmp/pubkey"
+          echo "   ssh ${USER}@${PUBLIC_IP} 'mkdir -p ~/.ssh && cat /tmp/pubkey >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys && rm /tmp/pubkey'"
+          echo "========================"
+
+      - name: Keep workflow alive for manual testing (optional)
+        if: ${{ always() }}
+        run: |
+          echo "Workflow finished configuration. If you want the job to keep running (so runner stays up), uncomment the loop below."
+          # NOTE: GitHub-hosted runners are ephemeral. Keeping the job alive does NOT give you a permanent VPS.
+          # Uncomment the following lines only if you intentionally want to keep this workflow job running for some time:
+          #
+          # while true; do
+          #   echo "[$(date)] runner alive - press ctrl+c in logs to stop"
+          #   sleep 300
+          # done
