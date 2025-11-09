@@ -68,18 +68,18 @@ jobs:
         
         # Configure SSH to allow password authentication
         $sshdConfig = @"
-        Port 22
-        Protocol 2
-        HostKey __PROGRAMDATA__/ssh/ssh_host_rsa_key
-        HostKey __PROGRAMDATA__/ssh/ssh_host_dsa_key
-        HostKey __PROGRAMDATA__/ssh/ssh_host_ecdsa_key
-        HostKey __PROGRAMDATA__/ssh/ssh_host_ed25519_key
-        AuthorizedKeysFile	.ssh/authorized_keys
-        PasswordAuthentication yes
-        PubkeyAuthentication yes
-        PermitEmptyPasswords no
-        Subsystem	sftp	sftp-server.exe
-        "#
+Port 22
+Protocol 2
+HostKey __PROGRAMDATA__/ssh/ssh_host_rsa_key
+HostKey __PROGRAMDATA__/ssh/ssh_host_dsa_key
+HostKey __PROGRAMDATA__/ssh/ssh_host_ecdsa_key
+HostKey __PROGRAMDATA__/ssh/ssh_host_ed25519_key
+AuthorizedKeysFile	.ssh/authorized_keys
+PasswordAuthentication yes
+PubkeyAuthentication yes
+PermitEmptyPasswords no
+Subsystem	sftp	sftp-server.exe
+"@
         
         Set-Content -Path "$env:ProgramData\ssh\sshd_config" -Value $sshdConfig -Force
         
@@ -250,13 +250,13 @@ jobs:
         refreshenv
         
         # Install essential development tools
-        choco install git -y --force --no-progress
-        choco install nodejs -y --force --no-progress
-        choco install python -y --force --no-progress
-        choco install vscode -y --force --no-progress
-        choco install curl -y --force --no-progress
-        choco install 7zip -y --force --no-progress
-        choco install wget -y --force --no-progress
+        choco install git -y --force
+        choco install nodejs -y --force
+        choco install python -y --force
+        choco install vscode -y --force
+        choco install curl -y --force
+        choco install 7zip -y --force
+        choco install wget -y --force
         
         Write-Host "✅ Development tools installed successfully"
 
