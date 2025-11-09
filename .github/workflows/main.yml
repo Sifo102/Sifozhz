@@ -1,23 +1,31 @@
-name: VPSon:
+name: VPS-SSH
+on:
   workflow_dispatch:
 
 jobs:
-  secure-vps:
+  configure-vps:
     runs-on: ubuntu-latest
-    timeout-minutes: 3600
+    timeout-minutes: 60
     steps:
-      - name: Configure Core SSH Settings
+
+      - name: Show header
         run: |
           echo "=== Configure VPS for SSH (port 22) ==="
+
+      - name: Update & install OpenSSH, UFW, Curl
+        run: |
           sudo apt-get update -y
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server ufw curl gnupg lsb-release
+
+      - name: Ensure sshd runtime dir exists and set basic config
+        run: |
           sudo mkdir -p /var/run/sshd
           sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak || true
           sudo sed -i 's/^#\?Port .*/Port 22/' /etc/ssh/sshd_config
           sudo sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin no/' /etc/ssh/sshd_config
           sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
 
-      - name: Create SSH User with Static Password
+      - name: Create SSH user and set password
         env:
           SSH_USER: TOOLBOXLAP
           SSH_PASS: ${{ secrets.SSH_PASSWORD }}
@@ -35,7 +43,7 @@ jobs:
           echo "SSH_PASS_SET=1" >> $GITHUB_ENV
           echo "User ${USER} created/ensured."
 
-      - name: Open Firewall Port 22 (UFW)
+      - name: Open firewall port 22 (UFW) and allow SSH
         run: |
           sudo ufw allow 22/tcp
           sudo ufw --force enable
@@ -47,7 +55,7 @@ jobs:
           sleep 2
           sudo systemctl status ssh --no-pager || sudo service ssh status
 
-      - name: Install Tailscale
+      - name: Install Tailscale VPN
         run: |
           curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -sc).noarmor.list | sudo tee /etc/apt/sources.list.d/tailscale.list
           curl -fsSL https://pkgs.tailscale.com/stable/gpg.key | sudo apt-key add -
@@ -74,16 +82,28 @@ jobs:
         run: |
           echo "Tailscale IP: $TAILSCALE_IP"
           ss -tlnp | grep ':22 ' || true
-          echo "Check connectivity from your Termux device via Tailscale"
+          echo "Check connectivity from Termux via Tailscale: ssh ${SSH_USER}@${TAILSCALE_IP} -p 22"
 
-      - name: Maintain Connection
+      - name: Output Termux connection info
         run: |
+          USER="${SSH_USER:-TOOLBOXLAP}"
+          PASS="${{ secrets.SSH_PASSWORD }}"
+          TS_IP="${TAILSCALE_IP}"
+          if [ -z "$PASS" ]; then PASS="admin@123"; fi
+          echo
           echo "=== SSH ACCESS INFO ==="
-          echo "Address: $TAILSCALE_IP"
-          echo "Username: TOOLBOXLAP"
-          echo "Password: (set in secret SSH_PASSWORD or default admin@123)"
+          echo "Address: $TS_IP"
+          echo "Username: $USER"
+          echo "Password: $PASS"
           echo "======================="
+          echo "Connect from Termux:"
+          echo "ssh ${USER}@${TS_IP} -p 22"
+
+      - name: Keep workflow alive
+        if: ${{ always() }}
+        run: |
+          echo "Workflow finished configuration. Keeping session alive..."
           while true; do
-            echo "[$(date)] VPS Active - use Ctrl+C in workflow to terminate"
+            echo "[$(date)] VPS Active - press Ctrl+C to terminate"
             sleep 300
           done
