@@ -1,109 +1,69 @@
-name: VPS-SSH
+name: VPS-Windows-SSH
 on:
   workflow_dispatch:
 
 jobs:
-  configure-vps:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+  secure-vps:
+    runs-on: windows-latest
+    timeout-minutes: 3600
     steps:
 
-      - name: Show header
+      - name: Install OpenSSH Server
         run: |
-          echo "=== Configure VPS for SSH (port 22) ==="
+          Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+          Start-Service sshd
+          Set-Service -Name sshd -StartupType 'Automatic'
+          # Firewall for SSH
+          if (-not (Get-NetFirewallRule -DisplayName "SSH")) {
+              New-NetFirewallRule -Name "SSH" -DisplayName "SSH" -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22
+          }
 
-      - name: Update & install OpenSSH, UFW, Curl
+      - name: Create SSH User with Static Password
         run: |
-          sudo apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server ufw curl gnupg lsb-release
+          $password = "admin@123"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          if (-not (Get-LocalUser -Name "TOOLBOXLAP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "TOOLBOXLAP" -Password $securePass -AccountNeverExpires
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member "TOOLBOXLAP"
+          echo "SSH_CREDS=User: TOOLBOXLAP | Password: $password" >> $env:GITHUB_ENV
+          if (-not (Get-LocalUser -Name "TOOLBOXLAP")) { Write-Error "User creation failed"; exit 1 }
 
-      - name: Ensure sshd runtime dir exists and set basic config
+      - name: Install Tailscale
         run: |
-          sudo mkdir -p /var/run/sshd
-          sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak || true
-          sudo sed -i 's/^#\?Port .*/Port 22/' /etc/ssh/sshd_config
-          sudo sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin no/' /etc/ssh/sshd_config
-          sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
 
-      - name: Create SSH user and set password
-        env:
-          SSH_USER: TOOLBOXLAP
-          SSH_PASS: ${{ secrets.SSH_PASSWORD }}
+      - name: Establish Tailscale VPN
         run: |
-          USER="${SSH_USER:-TOOLBOXLAP}"
-          PASS="${SSH_PASS:-admin@123}"
-          echo "Creating user: $USER"
-          if ! id -u "$USER" >/dev/null 2>&1; then
-            sudo useradd -m -s /bin/bash "$USER"
-            sudo usermod -aG sudo "$USER"
-          fi
-          echo "${USER}:${PASS}" | sudo chpasswd
-          sudo chage -M -1 "$USER" || true
-          echo "SSH_USER=${USER}" >> $GITHUB_ENV
-          echo "SSH_PASS_SET=1" >> $GITHUB_ENV
-          echo "User ${USER} created/ensured."
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned. Exiting."; exit 1 }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      - name: Open firewall port 22 (UFW) and allow SSH
+      - name: Output SSH Access Info
         run: |
-          sudo ufw allow 22/tcp
-          sudo ufw --force enable
-          sudo ufw status verbose
+          Write-Host "`n=== SSH ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Port: 22"
+          Write-Host "Username: TOOLBOXLAP"
+          Write-Host "Password: admin@123"
+          Write-Host "==================`n"
+          Write-Host "Connect from Termux: ssh TOOLBOXLAP@$env:TAILSCALE_IP -p 22"
 
-      - name: Restart sshd
+      - name: Keep VPS Alive
         run: |
-          sudo systemctl restart ssh || sudo service ssh restart
-          sleep 2
-          sudo systemctl status ssh --no-pager || sudo service ssh status
-
-      - name: Install Tailscale VPN
-        run: |
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -sc).noarmor.list | sudo tee /etc/apt/sources.list.d/tailscale.list
-          curl -fsSL https://pkgs.tailscale.com/stable/gpg.key | sudo apt-key add -
-          sudo apt-get update -y
-          sudo apt-get install -y tailscale
-          sudo systemctl enable --now tailscaled
-
-      - name: Establish Tailscale Connection
-        run: |
-          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$GITHUB_RUN_ID
-          TS_IP=""
-          for i in {1..10}; do
-            TS_IP="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
-            if [ -n "$TS_IP" ]; then break; fi
-            sleep 5
-          done
-          if [ -z "$TS_IP" ]; then
-            echo "Error: Tailscale IP not assigned"
-            exit 1
-          fi
-          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
-
-      - name: Verify SSH Accessibility
-        run: |
-          echo "Tailscale IP: $TAILSCALE_IP"
-          ss -tlnp | grep ':22 ' || true
-          echo "Check connectivity from Termux via Tailscale: ssh ${SSH_USER}@${TAILSCALE_IP} -p 22"
-
-      - name: Output Termux connection info
-        run: |
-          USER="${SSH_USER:-TOOLBOXLAP}"
-          PASS="${{ secrets.SSH_PASSWORD }}"
-          TS_IP="${TAILSCALE_IP}"
-          if [ -z "$PASS" ]; then PASS="admin@123"; fi
-          echo
-          echo "=== SSH ACCESS INFO ==="
-          echo "Address: $TS_IP"
-          echo "Username: $USER"
-          echo "Password: $PASS"
-          echo "======================="
-          echo "Connect from Termux:"
-          echo "ssh ${USER}@${TS_IP} -p 22"
-
-      - name: Keep workflow alive
-        if: ${{ always() }}
-        run: |
-          echo "Workflow finished configuration. Keeping session alive..."
-          while true; do
-            echo "[$(date)] VPS Active - press Ctrl+C to terminate"
-            sleep 300
-          done
+          Write-Host "VPS configured. Keeping session alive..."
+          while ($true) {
+              Write-Host "[$(Get-Date)] VPS Active - press Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
